@@ -6,6 +6,7 @@ import json
 from threading import Lock
 from functools import partial
 from typing import Iterator, List, Optional, Union, Dict
+from typing_extensions import TypedDict, Literal
 
 import llama_cpp
 
@@ -41,11 +42,30 @@ from llama_cpp.server.types import (
     DetokenizeInputResponse,
 )
 from llama_cpp.server.errors import RouteErrorHandler
+import hashlib
+from pathlib import Path
+
+MODEL_HASHS = []
+PREFIX = "/llmapi"
 
 
 router = APIRouter(route_class=RouteErrorHandler)
 
 _server_settings: Optional[ServerSettings] = None
+
+
+def calculate_sha256(model_settings):
+    hashs =[]
+    for model_setting in model_settings:
+        filename = model_setting.model
+        hash_sha256 = hashlib.sha256()
+        blksize = 1024 * 1024
+        with open(filename, "rb") as f:
+            for chunk in iter(lambda: f.read(blksize), b""):
+                hash_sha256.update(chunk)
+        code = hash_sha256.hexdigest()
+        hashs.append(code)
+    return hashs
 
 
 def set_server_settings(server_settings: ServerSettings):
@@ -144,6 +164,10 @@ def create_app(
 
     assert model_settings is not None
     set_llama_proxy(model_settings=model_settings)
+	
+    global MODEL_HASHS
+    if not MODEL_HASHS:
+        MODEL_HASHS = calculate_sha256(model_settings)
 
     if server_settings.disable_ping_events:
         set_ping_message_factory(lambda: bytes())
@@ -216,7 +240,7 @@ openai_v1_tag = "OpenAI V1"
 
 
 @router.post(
-    "/v1/completions",
+    "{}/v1/completions".format(PREFIX),
     summary="Completion",
     dependencies=[Depends(authenticate)],
     response_model=Union[
@@ -249,7 +273,7 @@ openai_v1_tag = "OpenAI V1"
     tags=[openai_v1_tag],
 )
 @router.post(
-    "/v1/engines/copilot-codex/completions",
+    "{}/v1/engines/copilot-codex/completions".format(PREFIX),
     include_in_schema=False,
     dependencies=[Depends(authenticate)],
     tags=[openai_v1_tag],
@@ -265,7 +289,7 @@ async def create_completion(
 
     llama = llama_proxy(
         body.model
-        if request.url.path != "/v1/engines/copilot-codex/completions"
+        if request.url.path != "{}/v1/engines/copilot-codex/completions".format(PREFIX)
         else "copilot-codex"
     )
 
@@ -319,7 +343,7 @@ async def create_completion(
 
 
 @router.post(
-    "/v1/embeddings",
+    "{}/v1/embeddings".format(PREFIX),
     summary="Embedding",
     dependencies=[Depends(authenticate)],
     tags=[openai_v1_tag],
@@ -335,7 +359,7 @@ async def create_embedding(
 
 
 @router.post(
-    "/v1/chat/completions",
+    "{}/v1/chat/completions".format(PREFIX),
     summary="Chat",
     dependencies=[Depends(authenticate)],
     response_model=Union[llama_cpp.ChatCompletion, str],
@@ -487,8 +511,26 @@ async def create_chat_completion(
         return iterator_or_completion
 
 
+class ModelData(TypedDict):
+    id: str
+    object: Literal["model"]
+    owned_by: str
+    permissions: List[str]
+    title: str
+    model_name: str
+    hash: str
+    sha256: str
+    filename: str
+    config: dict
+
+
+class ModelList(TypedDict):
+    object: Literal["list"]
+    data: List[ModelData]
+
+
 @router.get(
-    "/v1/models",
+    "{}/v1/models".format(PREFIX),
     summary="Models",
     dependencies=[Depends(authenticate)],
     tags=[openai_v1_tag],
@@ -496,17 +538,37 @@ async def create_chat_completion(
 async def get_models(
     llama_proxy: LlamaProxy = Depends(get_llama_proxy),
 ) -> ModelList:
-    return {
-        "object": "list",
-        "data": [
-            {
+    results = []
+    index = 0
+    for proxy in llama_proxy:
+        model_setting = llama_proxy._model_settings_dict[proxy]
+        file_name = model_setting.model
+        model_alias = model_setting.model_alias
+        sha256 = MODEL_HASHS[index]
+        index += 1
+        if sha256:
+            shorthash = sha256[:10]
+        else:
+            shorthash = ""
+        title = "{} [{}]".format(os.path.basename(file_name), shorthash)
+        model_name = Path(file_name).stem
+        config = {}
+        result = {
                 "id": model_alias,
                 "object": "model",
                 "owned_by": "me",
                 "permissions": [],
+                "title": title,
+                "model_name": model_name,
+                "hash": shorthash,
+                "sha256": sha256,
+                "filename": file_name,
+                "config": config
             }
-            for model_alias in llama_proxy
-        ],
+        results.append(result)
+    return {
+        "object": "list",
+        "data": results,
     }
 
 
@@ -514,7 +576,7 @@ extras_tag = "Extras"
 
 
 @router.post(
-    "/extras/tokenize",
+    "{}/extras/tokenize".format(PREFIX),
     summary="Tokenize",
     dependencies=[Depends(authenticate)],
     tags=[extras_tag],
@@ -529,7 +591,7 @@ async def tokenize(
 
 
 @router.post(
-    "/extras/tokenize/count",
+    "{}/extras/tokenize/count".format(PREFIX),
     summary="Tokenize Count",
     dependencies=[Depends(authenticate)],
     tags=[extras_tag],
@@ -544,7 +606,7 @@ async def count_query_tokens(
 
 
 @router.post(
-    "/extras/detokenize",
+    "{}/extras/detokenize".format(PREFIX),
     summary="Detokenize",
     dependencies=[Depends(authenticate)],
     tags=[extras_tag],
