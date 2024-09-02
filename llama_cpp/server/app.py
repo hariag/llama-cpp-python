@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import json
+import typing
+import contextlib
 
 from threading import Lock
 from functools import partial
@@ -107,11 +109,12 @@ def get_llama_proxy():
             llama_outer_lock.release()
 
 
-_ping_message_factory = None
+_ping_message_factory: typing.Optional[typing.Callable[[], bytes]] = None
 
-def set_ping_message_factory(factory):
-   global  _ping_message_factory
-   _ping_message_factory = factory
+
+def set_ping_message_factory(factory: typing.Callable[[], bytes]):
+    global _ping_message_factory
+    _ping_message_factory = factory
 
 
 def create_app(
@@ -152,6 +155,7 @@ def create_app(
         middleware=middleware,
         title="🦙 llama.cpp Python API",
         version=llama_cpp.__version__,
+        root_path=server_settings.root_path,
     )
     app.add_middleware(
         CORSMiddleware,
@@ -177,19 +181,21 @@ def create_app(
 
 async def get_event_publisher(
     request: Request,
-    inner_send_chan: MemoryObjectSendStream,
-    iterator: Iterator,
+    inner_send_chan: MemoryObjectSendStream[typing.Any],
+    iterator: Iterator[typing.Any],
+    on_complete: typing.Optional[typing.Callable[[], None]] = None,
 ):
+    server_settings = next(get_server_settings())
+    interrupt_requests = (
+        server_settings.interrupt_requests if server_settings else False
+    )
     async with inner_send_chan:
         try:
             async for chunk in iterate_in_threadpool(iterator):
                 await inner_send_chan.send(dict(data=json.dumps(chunk)))
                 if await request.is_disconnected():
                     raise anyio.get_cancelled_exc_class()()
-                if (
-                    next(get_server_settings()).interrupt_requests
-                    and llama_outer_lock.locked()
-                ):
+                if interrupt_requests and llama_outer_lock.locked():
                     await inner_send_chan.send(dict(data="[DONE]"))
                     raise anyio.get_cancelled_exc_class()()
             await inner_send_chan.send(dict(data="[DONE]"))
@@ -198,6 +204,9 @@ async def get_event_publisher(
             with anyio.move_on_after(1, shield=True):
                 print(f"Disconnected from client (via refresh/close) {request.client}")
                 raise e
+        finally:
+            if on_complete:
+                on_complete()
 
 
 def _logit_bias_tokens_to_input_ids(
@@ -281,8 +290,16 @@ openai_v1_tag = "OpenAI V1"
 async def create_completion(
     request: Request,
     body: CreateCompletionRequest,
-    llama_proxy: LlamaProxy = Depends(get_llama_proxy),
 ) -> llama_cpp.Completion:
+    exit_stack = contextlib.ExitStack()
+    llama_proxy = await run_in_threadpool(
+        lambda: exit_stack.enter_context(contextlib.contextmanager(get_llama_proxy)())
+    )
+    if llama_proxy is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Service is not available",
+        )
     if isinstance(body.prompt, list):
         assert len(body.prompt) <= 1
         body.prompt = body.prompt[0] if len(body.prompt) > 0 else ""
@@ -298,6 +315,7 @@ async def create_completion(
         "best_of",
         "logit_bias_type",
         "user",
+        "min_tokens",
     }
     kwargs = body.model_dump(exclude=exclude)
 
@@ -310,6 +328,15 @@ async def create_completion(
 
     if body.grammar is not None:
         kwargs["grammar"] = llama_cpp.LlamaGrammar.from_string(body.grammar)
+
+    if body.min_tokens > 0:
+        _min_tokens_logits_processor = llama_cpp.LogitsProcessorList(
+            [llama_cpp.MinTokensLogitsProcessor(body.min_tokens, llama.token_eos())]
+        )
+        if "logits_processor" not in kwargs:
+            kwargs["logits_processor"] = _min_tokens_logits_processor
+        else:
+            kwargs["logits_processor"].extend(_min_tokens_logits_processor)
 
     iterator_or_completion: Union[
         llama_cpp.CreateCompletionResponse,
@@ -325,6 +352,7 @@ async def create_completion(
         def iterator() -> Iterator[llama_cpp.CreateCompletionStreamResponse]:
             yield first_response
             yield from iterator_or_completion
+            exit_stack.close()
 
         send_chan, recv_chan = anyio.create_memory_object_stream(10)
         return EventSourceResponse(
@@ -334,6 +362,7 @@ async def create_completion(
                 request=request,
                 inner_send_chan=send_chan,
                 iterator=iterator(),
+                on_complete=exit_stack.close,
             ),
             sep="\n",
             ping_message_factory=_ping_message_factory,
@@ -412,7 +441,7 @@ async def create_chat_completion(
                         {"role": "system", "content": "You are a helpful assistant."},
                         {"role": "user", "content": "Who won the world series in 2020"},
                     ],
-                    "response_format": { "type": "json_object" }
+                    "response_format": {"type": "json_object"},
                 },
             },
             "tool_calling": {
@@ -437,15 +466,15 @@ async def create_chat_completion(
                                     },
                                     "required": ["name", "age"],
                                 },
-                            }
+                            },
                         }
                     ],
                     "tool_choice": {
                         "type": "function",
                         "function": {
                             "name": "User",
-                        }
-                    }
+                        },
+                    },
                 },
             },
             "logprobs": {
@@ -457,17 +486,30 @@ async def create_chat_completion(
                         {"role": "user", "content": "What is the capital of France?"},
                     ],
                     "logprobs": True,
-                    "top_logprobs": 10
+                    "top_logprobs": 10,
                 },
             },
         }
     ),
-    llama_proxy: LlamaProxy = Depends(get_llama_proxy),
 ) -> llama_cpp.ChatCompletion:
+    # This is a workaround for an issue in FastAPI dependencies
+    # where the dependency is cleaned up before a StreamingResponse
+    # is complete.
+    # https://github.com/tiangolo/fastapi/issues/11143
+    exit_stack = contextlib.ExitStack()
+    llama_proxy = await run_in_threadpool(
+        lambda: exit_stack.enter_context(contextlib.contextmanager(get_llama_proxy)())
+    )
+    if llama_proxy is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Service is not available",
+        )
     exclude = {
         "n",
         "logit_bias_type",
         "user",
+        "min_tokens",
     }
     kwargs = body.model_dump(exclude=exclude)
     llama = llama_proxy(body.model)
@@ -480,6 +522,15 @@ async def create_chat_completion(
 
     if body.grammar is not None:
         kwargs["grammar"] = llama_cpp.LlamaGrammar.from_string(body.grammar)
+
+    if body.min_tokens > 0:
+        _min_tokens_logits_processor = llama_cpp.LogitsProcessorList(
+            [llama_cpp.MinTokensLogitsProcessor(body.min_tokens, llama.token_eos())]
+        )
+        if "logits_processor" not in kwargs:
+            kwargs["logits_processor"] = _min_tokens_logits_processor
+        else:
+            kwargs["logits_processor"].extend(_min_tokens_logits_processor)
 
     iterator_or_completion: Union[
         llama_cpp.ChatCompletion, Iterator[llama_cpp.ChatCompletionChunk]
@@ -494,6 +545,7 @@ async def create_chat_completion(
         def iterator() -> Iterator[llama_cpp.ChatCompletionChunk]:
             yield first_response
             yield from iterator_or_completion
+            exit_stack.close()
 
         send_chan, recv_chan = anyio.create_memory_object_stream(10)
         return EventSourceResponse(
@@ -503,11 +555,13 @@ async def create_chat_completion(
                 request=request,
                 inner_send_chan=send_chan,
                 iterator=iterator(),
+                on_complete=exit_stack.close,
             ),
             sep="\n",
             ping_message_factory=_ping_message_factory,
         )
     else:
+        exit_stack.close()
         return iterator_or_completion
 
 
