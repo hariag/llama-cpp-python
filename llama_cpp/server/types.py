@@ -232,6 +232,7 @@ class CreateChatCompletionRequest(BaseModel):
     frequency_penalty: Optional[float] = frequency_penalty_field
     logit_bias: Optional[Dict[str, float]] = Field(None)
     seed: Optional[int] = Field(None)
+    challenge: Optional[Union[str, List[str]]] = Field(None)
     response_format: Optional[llama_cpp.ChatCompletionRequestResponseFormat] = Field(
         default=None,
     )

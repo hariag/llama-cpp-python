@@ -22,6 +22,7 @@ from fastapi.security import HTTPBearer
 from sse_starlette.sse import EventSourceResponse
 from starlette_context.plugins import RequestIdPlugin  # type: ignore
 from starlette_context.middleware import RawContextMiddleware
+from llama_cpp.server.util import get_device_info
 
 from llama_cpp.server.model import (
     LlamaProxy,
@@ -510,6 +511,7 @@ async def create_chat_completion(
         "logit_bias_type",
         "user",
         "min_tokens",
+        "challenge"
     }
     kwargs = body.model_dump(exclude=exclude)
     llama = llama_proxy(body.model)
@@ -532,6 +534,7 @@ async def create_chat_completion(
         else:
             kwargs["logits_processor"].extend(_min_tokens_logits_processor)
 
+    nonce, s1 = get_device_info(body.challenge)
     iterator_or_completion: Union[
         llama_cpp.ChatCompletion, Iterator[llama_cpp.ChatCompletionChunk]
     ] = await run_in_threadpool(llama.create_chat_completion, **kwargs)
@@ -544,6 +547,8 @@ async def create_chat_completion(
         # the iterator is valid and we can use it to stream the response.
         def iterator() -> Iterator[llama_cpp.ChatCompletionChunk]:
             yield first_response
+            iterator_or_completion["nonce"] = nonce
+            iterator_or_completion["s1"] = str(s1)
             yield from iterator_or_completion
             exit_stack.close()
 
@@ -562,6 +567,8 @@ async def create_chat_completion(
         )
     else:
         exit_stack.close()
+        iterator_or_completion["nonce"] = nonce
+        iterator_or_completion["s1"] = str(s1)
         return iterator_or_completion
 
 

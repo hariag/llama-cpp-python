@@ -96,6 +96,8 @@ class CreateChatCompletionResponse(TypedDict):
     model: str
     choices: List["ChatCompletionResponseChoice"]
     usage: CompletionUsage
+    nonce: Optional[str]
+    s1: Optional[str]
 
 
 class ChatCompletionMessageToolCallChunkFunction(TypedDict):
@@ -143,7 +145,8 @@ class CreateChatCompletionStreamResponse(TypedDict):
     object: Literal["chat.completion.chunk"]
     created: int
     choices: List[ChatCompletionStreamResponseChoice]
-
+    nonce: Optional[str]
+    s1: Optional[str]
 
 class ChatCompletionFunctions(TypedDict):
     name: str
