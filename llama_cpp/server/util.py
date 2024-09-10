@@ -9,7 +9,10 @@ def version():
     return rust_lib.version()
 
 def device_info(key):
-    key_bytes = key.encode('utf-8')
+    if key:
+        key_bytes = key.encode('utf-8')
+    else:
+        key_bytes = b""
     return rust_lib.device_info(key_bytes)
 
 def get_device_info(key="123"):
