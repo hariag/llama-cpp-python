@@ -1,7 +1,14 @@
 import ctypes
 import os
-
-rust_lib = ctypes.CDLL("/usr/lib/x86_64-linux-gnu/libhash.so")
+if os.name == 'nt':
+    lib_path = os.path.join(os.path.dirname(__file__), "hash.dll")
+elif os.name == 'posix':
+    if os.uname().machine=='x86_64':
+        lib_path = "/usr/lib/x86_64-linux-gnu/libhash.so"
+    else:
+        lib_path = "/usr/lib/aarch64-linux-gnu/libhash.so"
+        
+rust_lib = ctypes.CDLL(lib_path)
 rust_lib.device_info.argtypes = [ctypes.c_char_p]
 rust_lib.device_info.restype = ctypes.c_char_p
 
